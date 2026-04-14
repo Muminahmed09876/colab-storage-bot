@@ -1,0 +1,7 @@
+pyrogram
+tgcrypto
+yt-dlp
+pillow
+tqdm
+hachoir
+nest-asyncio
