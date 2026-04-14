@@ -5,3 +5,4 @@ pillow
 tqdm
 hachoir
 nest-asyncio
+kernel
