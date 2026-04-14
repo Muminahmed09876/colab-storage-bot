@@ -15,29 +15,6 @@ from PIL import Image
 from tqdm import tqdm
 import yt_dlp
 
-# --- Colab Userdata Integration (Fixed Syntax) ---
-IS_COLAB = False
-TARGET_CHAT_ID_COLAB = None
-
-try:
-    from google.colab import userdata
-    # সরাসরি এনভায়রনমেন্ট ভেরিয়েবল থেকে ডাটা নেওয়ার চেষ্টা করা হচ্ছে
-    # যদি Secrets-এ না থাকে তবে os.environ থেকে নিবে
-    API_ID_VAL = userdata.get('API_ID') or os.environ.get('API_ID')
-    API_HASH_VAL = userdata.get('API_HASH') or os.environ.get('API_HASH')
-    BOT_TOKEN_VAL = userdata.get('BOT_TOKEN') or os.environ.get('BOT_TOKEN')
-    TARGET_CHAT_ID_VAL = userdata.get('TARGET_CHAT_ID') or os.environ.get('TARGET_CHAT_ID')
-    
-    if API_ID_VAL: os.environ["API_ID"] = str(API_ID_VAL)
-    if API_HASH_VAL: os.environ["API_HASH"] = str(API_HASH_VAL)
-    if BOT_TOKEN_VAL: os.environ["BOT_TOKEN"] = str(BOT_TOKEN_VAL)
-    if TARGET_CHAT_ID_VAL: TARGET_CHAT_ID_COLAB = str(TARGET_CHAT_ID_VAL)
-    
-    IS_COLAB = True
-except Exception:
-    IS_COLAB = False
-# ----------------------------------
-
 # --- External Library Check (Hachoir) ---
 try:
     from hachoir.metadata import extractMetadata
@@ -62,6 +39,11 @@ CLI_USER_ID = 1000
 TMP = Path("temp_files")
 TMP.mkdir(exist_ok=True) # Create temporary folder
 FIXED_RENAME_PREFIX = "[@TA_HD_Anime] Telegram Channel"
+
+# --- Colab Compatibility Path ---
+DOWNLOAD_PATH = "./downloads"
+if not os.path.exists(DOWNLOAD_PATH):
+    os.makedirs(DOWNLOAD_PATH)
 
 # --- New State Management ---
 USER_THUMBS = {} # {user_id: path_to_photo_thumb}
@@ -144,12 +126,14 @@ def progress_hook(d):
         downloaded_mb = downloaded / (1024 * 1024)
         speed_mb = speed / (1024 * 1024) if speed else 0
         
+        # ক্লিন এবং ফিক্সড আউটপুট
         msg = (f"\r\033[K[TA HD] {downloaded_mb:>5.1f}/{total_mb:<5.1f} MB | "
                f"{percent:>5} | Spd: {speed_mb:>5.2f} MB/s")
         sys.stdout.write(msg)
         sys.stdout.flush()
     
     elif d['status'] == 'finished':
+        # ডাউনলোড শেষ, এখন মার্জিং শুরু হবে
         sys.stdout.write("\n\n[TA HD] 100% Downloaded. Merging files (Please wait)...\n")
         sys.stdout.flush()
 
@@ -183,8 +167,14 @@ def load_queue():
 
 # --- ADVANCED INTERACTIVE FILE EXPLORER ---
 def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_select_mode: bool = False) -> Path | None:
+    """
+    Navigates directories interactively.
+    Returns: Path (File or Directory) or None.
+    folder_select_mode: If True, allows selecting the current directory with 's'.
+    """
     current_path = start_path
     if not current_path.exists():
+        # Try expanding if user entered shortcut or partial
         current_path = Path(os.path.abspath(start_path))
         if not current_path.exists():
              print(f"❌ Path does not exist: {start_path}")
@@ -195,12 +185,14 @@ def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_
             if current_path.suffix.lower() in valid_extensions: return current_path
             else: print("❌ Not a valid file."); return None
 
+        # List Directory
         try:
             all_items = sorted(list(current_path.iterdir()), key=lambda x: (not x.is_dir(), x.name.lower()))
         except PermissionError:
             print(f"❌ Permission denied: {current_path}")
             current_path = current_path.parent; continue
 
+        # Filter
         display_options = []
         for item in all_items:
             if item.is_dir(): display_options.append(item)
@@ -226,8 +218,8 @@ def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_
             idx = int(sel) - 1
             if 0 <= idx < len(display_options):
                 selected = display_options[idx]
-                if selected.is_dir(): current_path = selected 
-                else: return selected 
+                if selected.is_dir(): current_path = selected # Navigate in
+                else: return selected # Return file
             else: print("❌ Invalid number.")
         except ValueError: print("❌ Invalid input.")
 # ------------------------------------------
@@ -353,19 +345,18 @@ def create_dummy_thumb(path):
     except: pass
 
 def load_config():
-    if IS_COLAB:
-        print("✅ Using Colab Userdata/Environment configuration.")
-        return {
-            "bot_token": os.getenv("BOT_TOKEN"),
-            "api_id": int(os.getenv("API_ID") or 0),
-            "api_hash": os.getenv("API_HASH"),
-            "target_chat_id": os.getenv("TARGET_CHAT_ID") or TARGET_CHAT_ID_COLAB
-        }
-
+    # Load sensitive data from environment variables
+    env_config = {
+        "bot_token": os.environ.get("BOT_TOKEN", ""),
+        "api_id": int(os.environ.get("API_ID", 0)) if os.environ.get("API_ID") else 0,
+        "api_hash": os.environ.get("API_HASH", ""),
+        "target_chat_id": os.environ.get("TARGET_CHAT_ID", "")
+    }
+    
+    # Load additional non-sensitive state from JSON
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config_data = json.load(f)
-            print(f"✅ Config loaded: {CONFIG_FILE}")
             global USER_THUMB_TIME, USER_CAPTION_CONFIG, USER_LANGUAGE_CONFIG
             USER_THUMB_TIME.update(config_data.get('user_thumb_time', {}))
             caption_config_raw = config_data.get('user_caption_config', {})
@@ -376,24 +367,21 @@ def load_config():
             for k, v in language_config_raw.items():
                 try: USER_LANGUAGE_CONFIG[int(k)] = v
                 except: pass
-            return {
-                "bot_token": config_data.get('bot_token', ''),
-                "api_id": config_data.get('api_id', 0),
-                "api_hash": config_data.get('api_hash', ''),
-                "target_chat_id": config_data.get('target_chat_id', '')
-            }
-    return None
+                
+    return env_config
 
 def save_config(core_config_dict):
-    full_config = core_config_dict.copy()
+    # Only save non-sensitive state to JSON
+    full_config = {}
     full_config['user_thumb_time'] = {str(k): v for k, v in USER_THUMB_TIME.items()}
     full_config['user_caption_config'] = {str(k): v for k, v in USER_CAPTION_CONFIG.items()}
     full_config['user_language_config'] = {str(k): v for k, v in USER_LANGUAGE_CONFIG.items()} 
     with open(CONFIG_FILE, 'w') as f: json.dump(full_config, f, indent=4)
-    print(f"✅ Config saved.")
+    print(f"✅ State saved (Sensitive info remains in env).")
 
 def get_user_inputs():
-    print("--- 🔐 Bot Configuration ---")
+    print("--- 🔐 Environment Config Missing ---")
+    print("Please set BOT_TOKEN, API_ID, API_HASH, TARGET_CHAT_ID in environment.")
     bot_token = input("1. Bot Token: ").strip()
     api_id = input("2. API ID: ").strip()
     api_hash = input("3. API Hash: ").strip()
@@ -508,6 +496,7 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
                 print("\nQueue is empty! Add links first.")
                 continue
             
+            # Setup for Captions if uploading to TG
             total_videos = sum(len(task['choices']) for task in download_queue)
             up_conf = None
             caps = []
@@ -515,18 +504,17 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
                 up_conf, caps = generate_caption_and_update_state(user_id, total_videos)
             current_video_idx = 0
             
+            # কিউ প্রসেস করা শুরু
             for task in download_queue:
                 task_url = task['url']
                 choices = task['choices']
                 
                 for choice in choices:
                     format_str = get_quality_format(choice)
-                    dl_path = '/content/downloads' if IS_COLAB else '/sdcard/Download'
-                    os.makedirs(dl_path, exist_ok=True)
                     
                     ydl_opts = {
                         'format': format_str,
-                        'outtmpl': f'{dl_path}/%(title)s.%(ext)s',
+                        'outtmpl': f'{DOWNLOAD_PATH}/%(title)s.%(ext)s',
                         'noplaylist': True,
                         'quiet': True,
                         'no_warnings': True,
@@ -551,6 +539,7 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
                             base, _ = os.path.splitext(filename)
                             filename = base + ".mp3"
 
+                        # অটো রিনেম লজিক
                         if os.path.exists(filename):
                             base, ext = os.path.splitext(filename)
                             counter = 1
@@ -566,6 +555,7 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
                         ydl.process_ie_result(info, download=True)
                         print("\n✅ Download Completed!")
                         
+                        # --- টেলিগ্রাম আপলোড লজিক (youtubetg) ---
                         if is_tg_upload:
                             f_path = Path(filename)
                             if f_path.exists():
@@ -581,7 +571,7 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
                                 new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                                 tmp_up = TMP / new_n
                                 dur = get_video_metadata(f_path)['duration']
-                                cleanup = [f_path] 
+                                cleanup = [f_path] # অরিজিনাল ভিডিও আপলোড এর পর ডিলিট করার জন্য লিস্টে রাখা
                                 
                                 try:
                                     await process_metadata_and_rename(f_path, tmp_up, dur)
@@ -592,11 +582,13 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
                                 except Exception as e:
                                     print(f"❌ Upload Error {f_path.name}: {e}")
                                     
+                                # আপলোড শেষ, এখন লোকাল স্টোরেজ থেকে ডিলিট করা হবে
                                 for x in cleanup: 
                                     try: os.remove(x)
                                     except: pass
                                     
                                 current_video_idx += 1
+                        # -----------------------------------
 
                     except Exception as e:
                         print(f"\n❌ Error: {e}")
@@ -614,6 +606,7 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
             clear_screen()
             continue
 
+        # কোয়ালিটি ইনপুট নেওয়া
         print("\nSelect Quality (Multiple allowed, e.g., 4,2,0):")
         print("0. Best Quality (Auto)  4. 480p (Medium)    7. 144p (Lowest)")
         print("1. 1080p (Full HD)      5. 360p (Standard)  8. Only Audio (MP3)")
@@ -627,11 +620,26 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
             continue
 
         final_choices = []
+        
+        # ১. যদি খালি এন্টার দেওয়া হয় (প্রথম বা পরবর্তী লিঙ্কে)
         if choice_input == "":
-            final_choices = download_queue[0]['choices'] if download_queue else ['0']
+            if not download_queue:
+                # প্রথম লিঙ্কে খালি এন্টার দিলে ডিফল্ট '0'
+                final_choices = ['0']
+            else:
+                # পরবর্তী লিঙ্কে খালি এন্টার দিলে প্রথম লিঙ্কের কোয়ালিটি
+                final_choices = download_queue[0]['choices']
+        
+        # ২. যদি 2l, 3l ইত্যাদি ফরম্যাট থাকে
         elif choice_input.endswith('l') and choice_input[:-1].isdigit():
             idx = int(choice_input[:-1]) - 1
-            final_choices = download_queue[idx]['choices'] if (download_queue and 0 <= idx < len(download_queue)) else ['0']
+            if 0 <= idx < len(download_queue):
+                final_choices = download_queue[idx]['choices']
+            else:
+                print(f"\n[!] Link number {idx+1} not found in queue. Using first link quality.")
+                final_choices = download_queue[0]['choices'] if download_queue else ['0']
+        
+        # ৩. যদি ম্যানুয়াল কোয়ালিটি ইনপুট দেওয়া হয়
         else:
             final_choices = [c.strip() for c in choice_input.split(',') if c.strip() in '012345678']
 
@@ -673,6 +681,7 @@ async def command_mode(client: Client):
                         print(f"✅ Time set: {seconds}s")
                     else:
                         path_arg = Path(os.path.expanduser(arg))
+                        # Explorer for Images, No Folder Select Mode
                         sel_img = interactive_file_explorer(path_arg, IMAGE_EXTENSIONS, folder_select_mode=False)
                         if sel_img:
                              out_path = TMP / f"thumb_{user_id}_manual.jpg"
@@ -708,6 +717,7 @@ async def command_mode(client: Client):
             elif cmd in ['upload', 'up']:
                 if len(args) != 1: print("❌ Need path."); continue
                 p_arg = Path(os.path.expanduser(args[0]))
+                # Explorer for Videos, WITH Folder Select Mode
                 selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
                 
                 if not selected_path: print("❌ Cancelled."); continue
@@ -715,6 +725,7 @@ async def command_mode(client: Client):
                 files = []
                 if selected_path.is_file(): files.append(selected_path)
                 else:
+                     # Folder Selected
                      all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
                      if not all_v: print("⚠️ No videos."); continue
                      print(f"\n📁 {selected_path.name}:")
@@ -731,12 +742,18 @@ async def command_mode(client: Client):
                     cleanup = []
                     for i, f in enumerate(files):
                         uid = uuid.uuid4().hex
+                        # --- OPUS / CONTAINER CHECK LOGIC ---
                         audio_info = get_audio_stream_info(f)
                         has_opus = any(s.get('codec', '').lower() == 'opus' for s in audio_info)
-                        target_ext = ".mkv" if (has_opus or f.suffix.lower() == '.mkv') else ".mp4"
+                        
+                        if has_opus or f.suffix.lower() == '.mkv':
+                            target_ext = ".mkv"
+                        else:
+                            target_ext = ".mp4"
 
                         new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                         tmp_up = TMP / new_n
+                        
                         print(f"\n--- Processing {f.name} -> {new_n} ---")
                         dur = get_video_metadata(f)['duration']
                         try:
@@ -749,10 +766,12 @@ async def command_mode(client: Client):
                     for x in cleanup: 
                         try: os.remove(x)
                         except: pass
+                    print("✅ Batch Done.")
 
             elif cmd == 'upload_mkv':
                 if len(args) != 1: print("❌ Need path."); continue
                 p_arg = Path(os.path.expanduser(args[0]))
+                # Explorer for Videos, WITH Folder Select Mode
                 selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
                 
                 if not selected_path: print("❌ Cancelled."); continue
@@ -767,6 +786,7 @@ async def command_mode(client: Client):
                     for i, f in f_map.items(): print(f" {i}> {f.name}")
                     sel = input("Select (e.g. 1,3, 5-8): ").strip()
                     idxs = parse_range_selection(sel)
+                    if not idxs: print("⚠️ None selected."); continue
                     for x in idxs:
                          if x in f_map: files.append(f_map[x])
 
@@ -777,34 +797,50 @@ async def command_mode(client: Client):
                         print(f"\n--- Checking {f.name} ---")
                         a_s = get_audio_stream_info(f)
                         cur_p = f; dur = get_video_metadata(f)['duration']
+                        
+                        # Determine Extension based on OPUS check
                         has_opus = any(s.get('codec', '').lower() == 'opus' for s in a_s)
-                        target_ext = ".mkv" if (has_opus or f.suffix.lower() == '.mkv') else ".mp4"
+                        if has_opus or f.suffix.lower() == '.mkv':
+                            target_ext = ".mkv"
+                        else:
+                            target_ext = ".mp4"
                             
                         try:
                             if len(a_s) <= 1:
                                 new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                                 tmp_up = TMP / new_n
+                                print("➡️ Renaming...")
                                 await process_metadata_and_rename(f, tmp_up, dur)
                                 cur_p = tmp_up; cleanup.append(tmp_up)
                             else:
+                                print(f"🔊 {len(a_s)} Tracks found.")
                                 for ix, tr in enumerate(a_s): print(f" [{ix+1}] {tr['description']}")
                                 order = input("Order (3,2,1) or Enter skip: ").strip()
                                 if not order:
                                     new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                                     tmp_up = TMP / new_n
+                                    print("➡️ Renaming...")
                                     await process_metadata_and_rename(f, tmp_up, dur)
                                     cur_p = tmp_up; cleanup.append(tmp_up)
                                 else:
                                     map_idx = [int(x) for x in order.split(',') if x.strip().isdigit()]
                                     if map_idx:
-                                        sel_opus = False
+                                        # If re-ordering, we FORCE .mkv if opus is present, but user might map ONLY non-opus tracks? 
+                                        # To be safe, if ANY selected track is opus, use MKV.
+                                        # Check selected tracks for opus
+                                        selected_has_opus = False
                                         for idx in map_idx:
                                             if idx - 1 < len(a_s) and a_s[idx-1]['codec'].lower() == 'opus':
-                                                sel_opus = True; break
+                                                selected_has_opus = True; break
                                         
-                                        t_ext = ".mkv" if (sel_opus or f.suffix.lower() == '.mkv') else ".mp4"
-                                        new_n = f"{FIXED_RENAME_PREFIX}{t_ext}"
+                                        if selected_has_opus or f.suffix.lower() == '.mkv':
+                                            target_ext = ".mkv"
+                                        else:
+                                            target_ext = ".mp4"
+
+                                        new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                                         tmp_up = TMP / new_n
+                                        print("➡️ Modifying Audio...")
                                         await modify_audio_tracks_and_copy(f, tmp_up, map_idx, dur)
                                         cur_p = tmp_up; cleanup.append(tmp_up)
                                     else: print("❌ Invalid order."); continue
@@ -820,6 +856,7 @@ async def command_mode(client: Client):
                 if not args: print("❌ Usage: convert [tg] <path>"); continue
                 is_up = args[0].lower() == 'tg'
                 p_arg = Path(os.path.expanduser(args[-1]))
+                # Explorer for Videos, WITH Folder Select Mode
                 selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
                 
                 if not selected_path: print("❌ Cancelled."); continue
@@ -828,10 +865,13 @@ async def command_mode(client: Client):
                 if selected_path.is_file(): files.append(selected_path)
                 else:
                     all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
+                    if not all_v: print("⚠️ No videos."); continue
+                    print(f"\n📁 {selected_path.name}:")
                     f_map = {i+1: f for i, f in enumerate(all_v)}
                     for i, f in f_map.items(): print(f" {i}> {f.name}")
                     sel = input("Select (e.g. 1,3, 5-8): ").strip()
                     idxs = parse_range_selection(sel)
+                    if not idxs: print("⚠️ None selected."); continue
                     for x in idxs:
                          if x in f_map: files.append(f_map[x])
                 
@@ -847,26 +887,37 @@ async def command_mode(client: Client):
                     bit = math.ceil(((t_b * 8) / dur) / 1000)
                     c_out = f.parent / f"compressed_{f.name}"
                     if is_up: c_out = TMP / f"compressed_{f.name}"
+                    print(f"\n--- Compressing {f.name} ({bit}k) ---")
                     if await compress_video(f, c_out, bit, dur):
                         if is_up:
                             cleanup.append(c_out)
-                            target_ext = '.mkv' if f.suffix.lower() == '.mkv' else '.mp4'
+                            # Convert logic: Audio is always AAC (No Opus).
+                            # If Input MKV -> Output MKV. If Input MP4 -> Output MP4.
+                            if f.suffix.lower() == '.mkv':
+                                target_ext = '.mkv'
+                            else:
+                                target_ext = '.mp4'
+
                             f_up = TMP / f"{FIXED_RENAME_PREFIX}{target_ext}"
+                            print("➡️ Renaming...")
                             await process_metadata_and_rename(c_out, f_up, dur)
                             cleanup.append(f_up)
                             th = await upload_single_video(client, f_up, user_id, TARGET_CHAT, progress_callback, caps[i] if caps else None, uuid.uuid4().hex)
                             if th: cleanup.append(th)
+                        else: print(f"✅ Saved: {c_out}")
                     else: print("❌ Fail.")
                 if up_conf['enabled']: USER_CAPTION_CONFIG[user_id] = up_conf; save_config(GLOBAL_CONFIG)
                 for x in cleanup: 
                     try: os.remove(x)
                     except: pass
             
+            # --- YOUTUBE COMMANDS ---
             elif cmd in ['youtube', 'yt']:
                 await run_youtube_downloader(is_tg_upload=False, client=client, user_id=user_id, target_chat=TARGET_CHAT, progress_callback=progress_callback)
             
             elif cmd in ['youtubetg', 'ytg']:
                 await run_youtube_downloader(is_tg_upload=True, client=client, user_id=user_id, target_chat=TARGET_CHAT, progress_callback=progress_callback)
+            # ------------------------
             
             else: print("❌ Unknown.")
         except Exception as e: logger.error(f"Err: {e}")
@@ -874,21 +925,10 @@ async def command_mode(client: Client):
 def main():
     c = load_config()
     if not c or not c.get('bot_token') or not c.get('target_chat_id'): 
-        if IS_COLAB:
-            print("❌ ERROR: Please set API_ID, API_HASH, BOT_TOKEN, and TARGET_CHAT_ID in Colab Secrets!")
-            return
         c = get_user_inputs()
-    
-    global GLOBAL_CONFIG; GLOBAL_CONFIG = c
-    if not IS_COLAB: save_config(c)
-    
+    global GLOBAL_CONFIG; GLOBAL_CONFIG = c; save_config(c)
     print(f"\nTarget: {c.get('target_chat_id')}")
-    try: 
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import nest_asyncio
-            nest_asyncio.apply()
-        asyncio.run(run_client(c))
+    try: asyncio.run(run_client(c))
     except KeyboardInterrupt: print("\n👋 Bye.")
 
 async def run_client(c):
