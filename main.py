@@ -322,22 +322,25 @@ async def modify_audio_tracks_and_copy(input_path: Path, output_path: Path, audi
     try: return await asyncio.to_thread(sync_modify)
     except subprocess.CalledProcessError as e: logger.error(f"FFmpeg Audio Failed: {e}"); raise
 
-# --- MODIFIED: 1-PASS COMPRESSION FOR SPEED ---
+# --- MODIFIED: AGGRESSIVE PARALLEL COMPRESSION ---
 async def compress_video(input_path: Path, output_path: Path, target_bitrate_kbps: int, duration_sec: int) -> bool:
     AUDIO_BITRATE_KBPS = 128
     video_bitrate_kbps = max(100, target_bitrate_kbps - AUDIO_BITRATE_KBPS)
     def sync_compress():
-        # Using 1-Pass Encoding for faster results in Colab
+        # Adding threads and slices for multi-core parallel processing
+        # This will process multiple parts of the frame/video simultaneously
         cmd = [
             "ffmpeg", "-y", "-i", str(input_path),
             "-c:v", "libx264", 
             "-b:v", f"{video_bitrate_kbps}k",
-            "-preset", "veryfast", # Using veryfast for speed
+            "-preset", "ultrafast", # Max speed
+            "-threads", "0",        # Uses all available CPU cores
+            "-slices", "4",         # Divides each frame into slices for parallel work
             "-c:a", "aac", 
             "-b:a", f"{AUDIO_BITRATE_KBPS}k", 
             str(output_path)
         ]
-        run_ffmpeg_command_with_progress(cmd, duration_sec, "Compression (1-Pass)")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, "Ultra-Fast Multi-Thread Compression")
         return output_path.exists() and output_path.stat().st_size > 0
     try: return await asyncio.to_thread(sync_compress)
     except Exception as e:
