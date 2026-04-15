@@ -322,21 +322,22 @@ async def modify_audio_tracks_and_copy(input_path: Path, output_path: Path, audi
     try: return await asyncio.to_thread(sync_modify)
     except subprocess.CalledProcessError as e: logger.error(f"FFmpeg Audio Failed: {e}"); raise
 
+# --- MODIFIED: 1-PASS COMPRESSION FOR SPEED ---
 async def compress_video(input_path: Path, output_path: Path, target_bitrate_kbps: int, duration_sec: int) -> bool:
     AUDIO_BITRATE_KBPS = 128
     video_bitrate_kbps = max(100, target_bitrate_kbps - AUDIO_BITRATE_KBPS)
-    pass_log = TMP / f"ffmpeg2pass-{uuid.uuid4().hex}"
     def sync_compress():
-        # Pass 1
-        cmd_pass1 = ["ffmpeg", "-y", "-i", str(input_path), "-b:v", f"{video_bitrate_kbps}k", "-pass", "1", "-passlogfile", str(pass_log), "-c:v", "libx264", "-preset", "medium", "-an", "-f", "null", "/dev/null"]
-        run_ffmpeg_command_with_progress(cmd_pass1, duration_sec, "Compression Pass 1")
-        # Pass 2
-        cmd_pass2 = ["ffmpeg", "-y", "-i", str(input_path), "-b:v", f"{video_bitrate_kbps}k", "-pass", "2", "-passlogfile", str(pass_log), "-c:v", "libx264", "-preset", "medium", "-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_KBPS}k", str(output_path)]
-        run_ffmpeg_command_with_progress(cmd_pass2, duration_sec, "Compression Pass 2")
-        # Clean up pass logs
-        for p in Path(".").glob(f"{pass_log.name}*"):
-            try: p.unlink()
-            except: pass
+        # Using 1-Pass Encoding for faster results in Colab
+        cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", 
+            "-b:v", f"{video_bitrate_kbps}k",
+            "-preset", "veryfast", # Using veryfast for speed
+            "-c:a", "aac", 
+            "-b:a", f"{AUDIO_BITRATE_KBPS}k", 
+            str(output_path)
+        ]
+        run_ffmpeg_command_with_progress(cmd, duration_sec, "Compression (1-Pass)")
         return output_path.exists() and output_path.stat().st_size > 0
     try: return await asyncio.to_thread(sync_compress)
     except Exception as e:
