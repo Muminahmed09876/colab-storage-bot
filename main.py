@@ -832,104 +832,226 @@ async def command_mode(client: Client):
                         except: pass
 
             elif cmd == 'convert':
-                if not args: print("❌ Usage: convert [tg] <path/link> [sizes...]"); continue
-                is_up = args[0].lower() == 'tg'
-                start_idx = 1 if is_up else 0
-                target_arg = args[start_idx]
-                
-                # Check for sizes like 50m, 1.9g, o
-                size_args = args[start_idx+1:] if len(args) > start_idx+1 else []
-                if not size_args:
+                is_up = False
+                if len(args) > 0 and args[0].lower() == 'tg':
+                    is_up = True
+
+                while True:
+                    convert_queue = []
+                    if os.path.exists('convert_queue.json'):
+                        with open('convert_queue.json', 'r') as f:
+                            convert_queue = json.load(f)
+
+                    print("\n" + "★"*45)
+                    print("      TA HD CONVERTER (MULTI-TASK & QUEUE)      ")
+                    print("★"*45)
+
+                    if convert_queue:
+                        print(f"\n[Queue Status]: {len(convert_queue)} items ready in list.")
+                        print("Type 'ok' to start processing all.")
+
+                    target_arg = input("\nEnter Link/Path (or 'e' exit, 'ok' start, 'c' clear): ").strip()
+
+                    if target_arg.lower() in ['e', 'exit']:
+                        break
+                    
+                    if target_arg.lower() in ['c', 'clear']:
+                        if os.path.exists('convert_queue.json'):
+                            os.remove('convert_queue.json')
+                        print("Queue cleared.")
+                        continue
+
+                    if target_arg.lower() == 'ok':
+                        if not convert_queue:
+                            print("\nQueue is empty! Please add links or paths first.")
+                            continue
+                        
+                        if not is_up:
+                            up_choice = input("Upload to Telegram after conversion? (y/n): ").strip().lower()
+                            if up_choice == 'y':
+                                is_up = True
+
+                        print("\n[+] Phase 1: Resolving and Downloading Sources...")
+                        final_jobs_to_process = [] 
+                        
+                        for item in convert_queue:
+                            t_arg = item['target']
+                            t_sizes = item['sizes']
+                            
+                            files_to_process = []
+                            if t_arg.startswith(('http://', 'https://')):
+                                print(f"🔗 Downloading URL: {t_arg} ...")
+                                try:
+                                    def dl_sync(url=t_arg):
+                                        ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': f'{DOWNLOAD_PATH}/%(title)s.%(ext)s', 'quiet': True}
+                                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                            info = ydl.extract_info(url, download=True)
+                                            return Path(ydl.prepare_filename(info))
+                                    dl_path = await asyncio.to_thread(dl_sync)
+                                    files_to_process.append(dl_path)
+                                    item['is_url'] = True
+                                except Exception as e:
+                                    print(f"❌ URL Download Failed: {e}")
+                                    continue
+                            else:
+                                p_arg = Path(t_arg)
+                                if p_arg.is_file():
+                                    files_to_process.append(p_arg)
+                                item['is_url'] = False
+                                
+                            for f_path in files_to_process:
+                                for sz in t_sizes:
+                                    final_jobs_to_process.append({
+                                        'source_path': f_path,
+                                        'target_bytes': sz,
+                                        'is_url': item.get('is_url', False)
+                                    })
+
+                        if not final_jobs_to_process:
+                            print("❌ No valid files found to process.")
+                            continue
+                        
+                        total_uploads = len(final_jobs_to_process)
+                        up_conf, caps = generate_caption_and_update_state(user_id, total_uploads)
+
+                        print(f"\n[+] Phase 2: Starting {total_uploads} Concurrent Conversions...")
+                        
+                        async def convert_job_task(job_idx, job_data):
+                            f = job_data['source_path']
+                            t_b = job_data['target_bytes']
+                            metadata = get_video_metadata(f)
+                            dur = metadata['duration']
+                            
+                            target_ext = '.mkv' if f.suffix.lower() == '.mkv' else '.mp4'
+                            uid = uuid.uuid4().hex
+                            result_path = None
+                            temp_files = []
+                            
+                            if dur == 0: return None, temp_files
+
+                            if t_b == -1:
+                                f_up = TMP / f"{FIXED_RENAME_PREFIX}_{uid}{target_ext}"
+                                try:
+                                    await process_metadata_and_rename(f, f_up, dur)
+                                    result_path = f_up
+                                except Exception as e:
+                                    print(f"\n❌ Metadata error on {f.name}: {e}")
+                            else:
+                                bit = math.ceil(((t_b * 8) / dur) / 1000)
+                                c_out = TMP / f"comp_{uid}{target_ext}"
+                                print(f"\n[Job {job_idx+1}] Compressing {f.name} to ~{t_b/(1024*1024):.1f}MB ({bit}kbps)...")
+                                success = await compress_video(f, c_out, bit, dur)
+                                if success:
+                                    temp_files.append(c_out)
+                                    f_up = TMP / f"{FIXED_RENAME_PREFIX}_{uid}{target_ext}"
+                                    try:
+                                        await process_metadata_and_rename(c_out, f_up, dur)
+                                        result_path = f_up
+                                    except Exception as e:
+                                        print(f"\n❌ Metadata error on {f.name}: {e}")
+                                else:
+                                    print(f"\n❌ Compression failed for {f.name}")
+                            
+                            return result_path, temp_files
+
+                        conversion_tasks = []
+                        for i, job in enumerate(final_jobs_to_process):
+                            task = asyncio.create_task(convert_job_task(i, job))
+                            conversion_tasks.append(task)
+                        
+                        print("\n[+] Waiting for conversions and uploading strictly in sequence...")
+                        
+                        for i, task in enumerate(conversion_tasks):
+                            result_path, temp_files = await task
+                            job_data = final_jobs_to_process[i]
+                            f_name = job_data['source_path'].name
+                            
+                            if result_path and result_path.exists():
+                                if is_up:
+                                    print(f"\n--- Uploading [Job {i+1}]: {f_name} ---")
+                                    th = await upload_single_video(client, result_path, user_id, TARGET_CHAT, progress_callback, caps[i], uuid.uuid4().hex)
+                                    if th: temp_files.append(th)
+                                else:
+                                    print(f"\n✅ Saved [Job {i+1}]: {result_path}")
+                                
+                                temp_files.append(result_path)
+                            else:
+                                print(f"\n❌ Failed to process [Job {i+1}]: {f_name}")
+                                
+                            for x in temp_files:
+                                try: os.remove(x)
+                                except: pass
+                        
+                        for job in final_jobs_to_process:
+                            if job.get('is_url', False):
+                                try: os.remove(job['source_path'])
+                                except: pass
+
+                        if up_conf['enabled']: 
+                            USER_CAPTION_CONFIG[user_id] = up_conf
+                            save_config(GLOBAL_CONFIG)
+                        
+                        if os.path.exists('convert_queue.json'):
+                            os.remove('convert_queue.json')
+                        
+                        input("\nAll conversion tasks finished. Press Enter to clear...")
+                        clear_screen()
+                        continue
+
+                    # --- Add to Queue Logic ---
+                    target_list = []
+                    if not target_arg.startswith(('http://', 'https://')):
+                        p_arg = Path(os.path.expanduser(target_arg))
+                        selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
+                        
+                        if not selected_path: 
+                            print("❌ Cancelled.")
+                            continue
+                            
+                        if selected_path.is_file(): 
+                            target_list.append(str(selected_path))
+                        else:
+                            all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
+                            if not all_v: 
+                                print("⚠️ No valid videos found in folder.")
+                                continue
+                            print(f"\n📁 {selected_path.name}:")
+                            f_map = {i+1: f for i, f in enumerate(all_v)}
+                            for i, f in f_map.items(): print(f" {i}> {f.name}")
+                            sel = input("Select (e.g. 1,3, 5-8, or 'all'): ").strip()
+                            if sel.lower() == 'all':
+                                target_list = [str(f) for f in all_v]
+                            else:
+                                idxs = parse_range_selection(sel)
+                                for x in idxs:
+                                    if x in f_map: target_list.append(str(f_map[x]))
+                    else:
+                        target_list.append(target_arg)
+
+                    if not target_list:
+                        continue
+                        
                     sz_input = input("Target Sizes (e.g. 50MB, 1.9GB, O): ").strip()
                     size_args = [s.strip() for s in sz_input.split(',')]
-                
-                target_bytes_list = []
-                for sa in size_args:
-                    tb = parse_size(sa)
-                    if tb != 0: target_bytes_list.append(tb)
-                
-                if not target_bytes_list: print("❌ No valid sizes provided."); continue
-
-                files_to_process = []
-                # Check if it's a URL or Path
-                if target_arg.startswith(('http://', 'https://')):
-                    print(f"🔗 URL Detected. Downloading via yt-dlp...")
-                    ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': f'{DOWNLOAD_PATH}/%(title)s.%(ext)s'}
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(target_arg, download=True)
-                            files_to_process.append(Path(ydl.prepare_filename(info)))
-                    except Exception as e: print(f"❌ Download failed: {e}"); continue
-                else:
-                    p_arg = Path(os.path.expanduser(target_arg))
-                    selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
-                    if not selected_path: print("❌ Cancelled."); continue
-                    if selected_path.is_file(): files_to_process.append(selected_path)
-                    else:
-                        all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
-                        if not all_v: print("⚠️ No videos."); continue
-                        print(f"\n📁 {selected_path.name}:")
-                        f_map = {i+1: f for i, f in enumerate(all_v)}
-                        for i, f in f_map.items(): print(f" {i}> {f.name}")
-                        sel = input("Select (e.g. 1,3, 5-8): ").strip()
-                        idxs = parse_range_selection(sel)
-                        for x in idxs:
-                            if x in f_map: files_to_process.append(f_map[x])
-
-                if not files_to_process: continue
-                
-                total_uploads = len(files_to_process) * len(target_bytes_list)
-                up_conf, caps = generate_caption_and_update_state(user_id, total_uploads)
-                
-                cap_counter = 0
-                for f in files_to_process:
-                    metadata = get_video_metadata(f)
-                    dur = metadata['duration']
-                    if dur == 0: continue
                     
-                    for t_b in target_bytes_list:
-                        cleanup = []
-                        target_ext = '.mkv' if f.suffix.lower() == '.mkv' else '.mp4'
+                    target_bytes_list = []
+                    for sa in size_args:
+                        tb = parse_size(sa)
+                        if tb != 0: target_bytes_list.append(tb)
+                    
+                    if not target_bytes_list:
+                        print("❌ No valid sizes provided.")
+                        continue
                         
-                        if t_b == -1: # Original Size
-                            print(f"\n--- Processing Original: {f.name} ---")
-                            f_up = TMP / f"{FIXED_RENAME_PREFIX}{target_ext}"
-                            await process_metadata_and_rename(f, f_up, dur)
-                            cleanup.append(f_up)
-                            if is_up:
-                                th = await upload_single_video(client, f_up, user_id, TARGET_CHAT, progress_callback, caps[cap_counter], uuid.uuid4().hex)
-                                if th: cleanup.append(th)
-                            else: print(f"✅ Saved Original: {f_up}")
-                        else:
-                            # Compression
-                            bit = math.ceil(((t_b * 8) / dur) / 1000)
-                            c_out = TMP / f"comp_{uuid.uuid4().hex}{target_ext}"
-                            print(f"\n--- Compressing {f.name} to ~{t_b/(1024*1024):.1f}MB ({bit}kbps) ---")
-                            if await compress_video(f, c_out, bit, dur):
-                                cleanup.append(c_out)
-                                f_up = TMP / f"{FIXED_RENAME_PREFIX}{target_ext}"
-                                await process_metadata_and_rename(c_out, f_up, dur)
-                                cleanup.append(f_up)
-                                if is_up:
-                                    th = await upload_single_video(client, f_up, user_id, TARGET_CHAT, progress_callback, caps[cap_counter], uuid.uuid4().hex)
-                                    if th: cleanup.append(th)
-                                else: print(f"✅ Saved Compressed: {f_up}")
-                            else: print(f"❌ Compression failed for {f.name}")
-                        
-                        cap_counter += 1
-                        for x in cleanup:
-                            try: os.remove(x)
-                            except: pass
-
-                if up_conf['enabled']: 
-                    USER_CAPTION_CONFIG[user_id] = up_conf
-                    save_config(GLOBAL_CONFIG)
-                
-                # If target was a downloaded file from URL, delete original
-                if target_arg.startswith('http'):
-                    for f in files_to_process:
-                        try: os.remove(f)
-                        except: pass
+                    for t in target_list:
+                        convert_queue.append({
+                            'target': t,
+                            'sizes': target_bytes_list
+                        })
+                    
+                    with open('convert_queue.json', 'w') as f:
+                        json.dump(convert_queue, f, indent=4)
+                    print(f"\n[+] Successfully added to convert queue. (Total: {len(convert_queue)})")
 
             elif cmd in ['youtube', 'yt']:
                 await run_youtube_downloader(is_tg_upload=False, client=client, user_id=user_id, target_chat=TARGET_CHAT, progress_callback=progress_callback)
