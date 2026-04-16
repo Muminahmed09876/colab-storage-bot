@@ -639,10 +639,61 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
             print("\nInvalid selection!")
 # ----------------------------------------
 
+# --- NEW: DIRECT DOWNLOAD TO GOOGLE DRIVE ---
+async def direct_download_to_drive():
+    print("\n--- 📥 Direct Download to Google Drive ---")
+    url = input("Enter Direct Download Link: ").strip()
+    if not url: return
+
+    # In Colab, the Drive is usually mounted at /content/drive/MyDrive
+    drive_base = Path("/content/drive/MyDrive")
+    if not drive_base.exists():
+        print("⚠️ Google Drive not detected at /content/drive/MyDrive.")
+        print("Attempting to use local 'downloads' folder instead.")
+        save_dir = Path(DOWNLOAD_PATH)
+    else:
+        save_dir = drive_base / "TA_HD_Downloads"
+        save_dir.mkdir(exist_ok=True)
+
+    print(f"File will be saved in: {save_dir}")
+    
+    # Extract filename from URL or use a default
+    try:
+        raw_name = url.split('/')[-1].split('?')[0]
+        if not raw_name: raw_name = f"downloaded_file_{uuid.uuid4().hex[:8]}"
+        filename = raw_name
+    except:
+        filename = f"file_{uuid.uuid4().hex[:8]}"
+
+    target_path = save_dir / filename
+    
+    # Using 'wget' via subprocess for progress bar and stability
+    print(f"🚀 Downloading: {filename}")
+    try:
+        cmd = ["wget", "-O", str(target_path), url]
+        # subprocess.run(cmd, check=True)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        
+        # Simple output monitor
+        for line in process.stdout:
+            if "%" in line:
+                sys.stdout.write(f"\r[Progress]: {line.strip()}")
+                sys.stdout.flush()
+        
+        process.wait()
+        if process.returncode == 0:
+            print(f"\n✅ Download Finished! Path: {target_path}")
+        else:
+            print(f"\n❌ Download failed with return code {process.returncode}")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+
+# ----------------------------------------------
+
 async def command_mode(client: Client):
     global GLOBAL_CONFIG
     print("\n--- 💻 Command Mode ---")
-    print("Cmds: set_thum <path/time> | del_thum | set_cap | upload | upload_mkv | convert | youtube or yt | youtubetg or ytg")
+    print("Cmds: set_thum | del_thum | set_cap | upload | upload_mkv | convert | youtube/yt | youtubetg/ytg | d (Drive DL)")
     TARGET_CHAT = GLOBAL_CONFIG.get('target_chat_id', 'me')
     user_id = CLI_USER_ID 
     def progress_callback(current, total, *args):
@@ -658,7 +709,10 @@ async def command_mode(client: Client):
             if not parts: continue
             cmd = parts[0].lower(); args = parts[1:]
 
-            if cmd in ['set_thum', 'thum']:
+            if cmd == 'd':
+                await direct_download_to_drive()
+
+            elif cmd in ['set_thum', 'thum']:
                 if len(args) == 1:
                     arg = " ".join(args).strip()
                     seconds = parse_time(arg)
@@ -1069,12 +1123,4 @@ def main():
     global GLOBAL_CONFIG; GLOBAL_CONFIG = c; save_config(c)
     print(f"\nTarget: {c.get('target_chat_id')}")
     try: asyncio.run(run_client(c))
-    except KeyboardInterrupt: print("\n👋 Bye.")
-
-async def run_client(c):
-    if not c['bot_token']: return
-    app = Client("my_session", api_id=c['api_id'], api_hash=c['api_hash'], bot_token=c['bot_token'])
-    async with app: logger.info("🟢 Online."); await command_mode(app)
-
-if __name__ == "__main__":
-    main()
+    except KeyboardInterrupt:
