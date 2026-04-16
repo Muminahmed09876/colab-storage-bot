@@ -639,61 +639,10 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
             print("\nInvalid selection!")
 # ----------------------------------------
 
-# --- NEW: DIRECT DOWNLOAD TO GOOGLE DRIVE ---
-async def direct_download_to_drive():
-    print("\n--- 📥 Direct Download to Google Drive ---")
-    url = input("Enter Direct Download Link: ").strip()
-    if not url: return
-
-    # In Colab, the Drive is usually mounted at /content/drive/MyDrive
-    drive_base = Path("/content/drive/MyDrive")
-    if not drive_base.exists():
-        print("⚠️ Google Drive not detected at /content/drive/MyDrive.")
-        print("Attempting to use local 'downloads' folder instead.")
-        save_dir = Path(DOWNLOAD_PATH)
-    else:
-        save_dir = drive_base / "TA_HD_Downloads"
-        save_dir.mkdir(exist_ok=True)
-
-    print(f"File will be saved in: {save_dir}")
-    
-    # Extract filename from URL or use a default
-    try:
-        raw_name = url.split('/')[-1].split('?')[0]
-        if not raw_name: raw_name = f"downloaded_file_{uuid.uuid4().hex[:8]}"
-        filename = raw_name
-    except:
-        filename = f"file_{uuid.uuid4().hex[:8]}"
-
-    target_path = save_dir / filename
-    
-    # Using 'wget' via subprocess for progress bar and stability
-    print(f"🚀 Downloading: {filename}")
-    try:
-        cmd = ["wget", "-O", str(target_path), url]
-        # subprocess.run(cmd, check=True)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        
-        # Simple output monitor
-        for line in process.stdout:
-            if "%" in line:
-                sys.stdout.write(f"\r[Progress]: {line.strip()}")
-                sys.stdout.flush()
-        
-        process.wait()
-        if process.returncode == 0:
-            print(f"\n✅ Download Finished! Path: {target_path}")
-        else:
-            print(f"\n❌ Download failed with return code {process.returncode}")
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-
-# ----------------------------------------------
-
 async def command_mode(client: Client):
     global GLOBAL_CONFIG
     print("\n--- 💻 Command Mode ---")
-    print("Cmds: set_thum | del_thum | set_cap | upload | upload_mkv | convert | youtube/yt | youtubetg/ytg | d (Drive DL)")
+    print("Cmds: set_thum <path/time> | del_thum | set_cap | upload | upload_mkv | convert | youtube or yt | youtubetg or ytg | d")
     TARGET_CHAT = GLOBAL_CONFIG.get('target_chat_id', 'me')
     user_id = CLI_USER_ID 
     def progress_callback(current, total, *args):
@@ -709,10 +658,7 @@ async def command_mode(client: Client):
             if not parts: continue
             cmd = parts[0].lower(); args = parts[1:]
 
-            if cmd == 'd':
-                await direct_download_to_drive()
-
-            elif cmd in ['set_thum', 'thum']:
+            if cmd in ['set_thum', 'thum']:
                 if len(args) == 1:
                     arg = " ".join(args).strip()
                     seconds = parse_time(arg)
@@ -1113,6 +1059,94 @@ async def command_mode(client: Client):
             elif cmd in ['youtubetg', 'ytg']:
                 await run_youtube_downloader(is_tg_upload=True, client=client, user_id=user_id, target_chat=TARGET_CHAT, progress_callback=progress_callback)
             
+            elif cmd == 'd':
+                print("\n--- 📥 Direct Download & Google Drive Upload ---")
+                urls_input = input("Enter direct download links (comma separated): ").strip()
+                if not urls_input: continue
+                urls = [u.strip() for u in urls_input.split(',')]
+                
+                op_input = input("Type 'mkv hindi' for Hindi audio extraction -> MP4, or press Enter to skip: ").strip().lower()
+                
+                # Google Drive path setup for Colab environment
+                gdrive_path = Path("/content/drive/MyDrive/TA_HD_Uploads")
+                if not gdrive_path.exists():
+                    try:
+                        gdrive_path.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        print(f"⚠️ Google Drive mount not found at {gdrive_path}. Saving locally to {DOWNLOAD_PATH}/GDrive_Uploads")
+                        gdrive_path = Path(DOWNLOAD_PATH) / "GDrive_Uploads"
+                        gdrive_path.mkdir(parents=True, exist_ok=True)
+
+                for url in urls:
+                    if not url: continue
+                    print(f"\n[+] Downloading from Direct Link: {url}")
+                    
+                    dl_dir = TMP / uuid.uuid4().hex
+                    dl_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    try:
+                        subprocess.run(["wget", "-q", "--show-progress", "--content-disposition", "-P", str(dl_dir), url], check=True)
+                    except Exception as e:
+                        print(f"❌ Download failed for {url}: {e}")
+                        continue
+                    
+                    downloaded_files = list(dl_dir.iterdir())
+                    if not downloaded_files:
+                        print("❌ No file found after download.")
+                        continue
+                        
+                    dl_file = downloaded_files[0]
+                    final_file = dl_file
+                    
+                    if op_input == 'mkv hindi':
+                        print(f"\n[+] Processing 'mkv hindi' for {dl_file.name}...")
+                        audio_info = get_audio_stream_info(dl_file)
+                        hindi_idx = -1
+                        
+                        for i, a in enumerate(audio_info):
+                            lang = a.get('language', '').lower()
+                            title = a.get('title', '').lower()
+                            if 'hin' in lang or 'hindi' in title:
+                                hindi_idx = i
+                                break
+                                
+                        if hindi_idx == -1 and audio_info:
+                            print("⚠️ Hindi audio track not found automatically. Using the first audio track.")
+                            hindi_idx = 0
+                            
+                        if audio_info:
+                            out_name = f"{dl_file.stem}_hindi.mp4"
+                            out_path = dl_dir / out_name
+                            
+                            cmd_ffmpeg = [
+                                "ffmpeg", "-y", "-i", str(dl_file),
+                                "-map", "0:v:0",
+                                "-map", f"0:a:{hindi_idx}",
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                str(out_path)
+                            ]
+                            print(f"➡️ Extracting Audio Track {hindi_idx} and converting to MP4...")
+                            try:
+                                dur = get_video_metadata(dl_file).get('duration', 0)
+                                if dur > 0:
+                                    run_ffmpeg_command_with_progress(cmd_ffmpeg, dur, "MKV Hindi -> MP4")
+                                else:
+                                    subprocess.run(cmd_ffmpeg, check=True)
+                                final_file = out_path
+                            except Exception as e:
+                                print(f"❌ FFmpeg processing failed: {e}")
+                                
+                    print(f"\n[+] Uploading to Google Drive directory: {gdrive_path} ...")
+                    target_gdrive_file = gdrive_path / final_file.name
+                    try:
+                        shutil.copy2(final_file, target_gdrive_file)
+                        print(f"✅ Successfully uploaded to Google Drive: {target_gdrive_file}")
+                    except Exception as e:
+                        print(f"❌ Failed to upload to Google Drive: {e}")
+                        
+                    shutil.rmtree(dl_dir, ignore_errors=True)
+
             else: print("❌ Unknown.")
         except Exception as e: logger.error(f"Err: {e}")
 
@@ -1123,4 +1157,12 @@ def main():
     global GLOBAL_CONFIG; GLOBAL_CONFIG = c; save_config(c)
     print(f"\nTarget: {c.get('target_chat_id')}")
     try: asyncio.run(run_client(c))
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: print("\n👋 Bye.")
+
+async def run_client(c):
+    if not c['bot_token']: return
+    app = Client("my_session", api_id=c['api_id'], api_hash=c['api_hash'], bot_token=c['bot_token'])
+    async with app: logger.info("🟢 Online."); await command_mode(app)
+
+if __name__ == "__main__":
+    main()
