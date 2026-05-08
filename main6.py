@@ -1398,4 +1398,8 @@ def main():
 
 async def run_client(c):
     if not c['bot_token']: return
-    app = Client("my_session", api_id=c['api_id'], api_hash=c['api_
+    app = Client("my_session", api_id=c['api_id'], api_hash=c['api_hash'], bot_token=c['bot_token'])
+    async with app: logger.info("🟢 Online."); await command_mode(app)
+
+if __name__ == "__main__":
+    main()
