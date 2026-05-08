@@ -167,21 +167,36 @@ def load_queue():
 
 # --- Recursive Zip Extractor ---
 def recursive_unzip(zip_file_path, extract_to):
-    """Recursively extract zip files including zips within zips."""
+    """Recursively extract zip files including zips within zips with duplicate prevention."""
     try:
+        # Resolve path to handle any issues
+        zip_file_path = Path(zip_file_path)
+        if not zipfile.is_zipfile(zip_file_path):
+            return False
+            
         with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
             zip_ref.extractall(extract_to)
         
-        # After extraction, check for more zip files in the extracted folder
-        for root, dirs, files in os.walk(extract_to):
-            for file in files:
-                if file.lower().endswith('.zip'):
-                    nested_zip_path = os.path.join(root, file)
-                    print(f"📦 Found nested zip: {file}. Extracting...")
-                    recursive_unzip(nested_zip_path, root)
-                    try:
-                        os.remove(nested_zip_path) # Delete nested zip after extraction
-                    except: pass
+        # Check for more zip files in the extracted folder
+        found_zip = True
+        while found_zip:
+            found_zip = False
+            for root, dirs, files in os.walk(extract_to):
+                for file in files:
+                    if file.lower().endswith('.zip'):
+                        nested_zip_path = Path(root) / file
+                        # If the nested zip is the same as the one we just tried to extract, skip to avoid loop
+                        if nested_zip_path.resolve() == zip_file_path.resolve():
+                            continue
+                            
+                        print(f"📦 Found nested zip: {file}. Extracting...")
+                        try:
+                            with zipfile.ZipFile(nested_zip_path, 'r') as nested_ref:
+                                nested_ref.extractall(root)
+                            os.remove(nested_zip_path)
+                            found_zip = True # Loop again to check if new zips were inside
+                        except Exception as e:
+                            print(f"⚠️ Could not extract nested zip {file}: {e}")
         return True
     except Exception as e:
         print(f"❌ Extraction error: {e}")
@@ -743,7 +758,7 @@ async def command_mode(client: Client):
                         print(f"❌ Download failed: {e}")
                         continue
                         
-                    # Check for zip and extract recursively
+                    # Recursive extraction with logic check
                     downloaded_files = list(dl_dir.iterdir())
                     for f in downloaded_files:
                         if f.suffix.lower() == '.zip':
