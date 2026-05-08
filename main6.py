@@ -306,7 +306,7 @@ async def process_metadata_and_rename(input_path: Path, output_path: Path, durat
         if audio_info:
             for i in range(len(audio_info)): cmd.extend([f"-metadata:s:a:{i}", f"title={FIXED_RENAME_PREFIX}"])
         cmd.append(str(output_path))
-        run_ffmpeg_command_with_progress(cmd, duration_sec, "Renaming & Metadata Update")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Renaming: {input_path.name[:10]}")
         if not (output_path.exists() and output_path.stat().st_size > 0): raise Exception("FFmpeg failed.")
         return True
     try: return await asyncio.to_thread(sync_process)
@@ -320,7 +320,7 @@ async def modify_audio_tracks_and_copy(input_path: Path, output_path: Path, audi
             if user_index <= 0: continue
             cmd.extend(["-map", f"0:a:{user_index - 1}", f"-metadata:s:a:{i}", f"title={FIXED_RENAME_PREFIX}"])
         cmd.extend(["-map", "0:s?", "-map", "0:d?", "-disposition:a:0", "default", str(output_path)])
-        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Audio Modify: {audio_map_indices}")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Audio Mod: {input_path.name[:10]}")
         if not (output_path.exists() and output_path.stat().st_size > 0): raise Exception("FFmpeg failed.")
         return True
     try: return await asyncio.to_thread(sync_modify)
@@ -341,7 +341,7 @@ async def compress_video(input_path: Path, output_path: Path, target_bitrate_kbp
             "-b:a", f"{AUDIO_BITRATE_KBPS}k", 
             str(output_path)
         ]
-        run_ffmpeg_command_with_progress(cmd, duration_sec, "Compression (1-Pass)")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Compressing: {input_path.name[:10]}")
         return output_path.exists() and output_path.stat().st_size > 0
     try: return await asyncio.to_thread(sync_compress)
     except Exception as e:
@@ -888,8 +888,9 @@ async def command_mode(client: Client):
                     up_conf, caps = generate_caption_and_update_state(user_id, len(files))
                     jobs = []
                     
-                    print("\n[+] Phase 1: Processing Metadata and Renaming sequentially...")
-                    for i, f in enumerate(files):
+                    print("\n[+] Phase 1: Processing Metadata and Renaming concurrently (Parallel)...")
+                    
+                    async def process_up_task(i, f, cap):
                         uid = uuid.uuid4().hex
                         audio_info = get_audio_stream_info(f)
                         has_opus = any(s.get('codec', '').lower() == 'opus' for s in audio_info)
@@ -902,21 +903,37 @@ async def command_mode(client: Client):
                         new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                         tmp_up = TMP / new_n
                         
-                        print(f"\n--- Processing {f.name} -> {new_n} ---")
+                        print(f"➡️ Task queued for: {f.name[:20]}")
                         dur = get_video_metadata(f)['duration']
                         cleanup = []
                         try:
                             await process_metadata_and_rename(f, tmp_up, dur)
                             cleanup.append(tmp_up)
                             
-                            jobs.append({
+                            return {
                                 'video_path': tmp_up,
-                                'caption': caps[i] if caps else None,
+                                'caption': cap,
                                 'unique_id': uid,
                                 'metadata': get_video_metadata(tmp_up),
-                                'cleanup_files': cleanup
+                                'cleanup_files': cleanup,
+                                'success': True
+                            }
+                        except Exception as e:
+                            print(f"❌ Error {f.name}: {e}")
+                            return {'success': False}
+
+                    tasks = [process_up_task(i, f, caps[i] if caps else None) for i, f in enumerate(files)]
+                    results = await asyncio.gather(*tasks)
+                    
+                    for res in results:
+                        if res.get('success'):
+                            jobs.append({
+                                'video_path': res['video_path'],
+                                'caption': res['caption'],
+                                'unique_id': res['unique_id'],
+                                'metadata': res['metadata'],
+                                'cleanup_files': res['cleanup_files']
                             })
-                        except Exception as e: print(f"❌ Error {f.name}: {e}")
                     
                     if jobs:
                         await upload_batch_videos(client, jobs, user_id, TARGET_CHAT)
@@ -954,65 +971,77 @@ async def command_mode(client: Client):
                     up_conf, caps = generate_caption_and_update_state(user_id, len(files))
                     jobs = []
                     
-                    print("\n[+] Phase 1: Processing Audio and Metadata sequentially...")
+                    print("\n[+] Phase 1: Analyzing Audio Tracks (Interactive)...")
+                    plans = []
                     for i, f in enumerate(files):
                         print(f"\n--- Checking {f.name} ---")
                         a_s = get_audio_stream_info(f)
-                        cur_p = f; dur = get_video_metadata(f)['duration']
-                        cleanup = []
+                        dur = get_video_metadata(f)['duration']
                         
                         has_opus = any(s.get('codec', '').lower() == 'opus' for s in a_s)
-                        if has_opus or f.suffix.lower() == '.mkv':
-                            target_ext = ".mkv"
+                        target_ext = ".mkv" if (has_opus or f.suffix.lower() == '.mkv') else ".mp4"
+                            
+                        if len(a_s) <= 1:
+                            plans.append({'file': f, 'type': 'rename', 'dur': dur, 'target_ext': target_ext, 'cap': caps[i] if caps else None})
                         else:
-                            target_ext = ".mp4"
-                            
-                        try:
-                            if len(a_s) <= 1:
-                                new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
-                                tmp_up = TMP / new_n
-                                print("➡️ Renaming...")
-                                await process_metadata_and_rename(f, tmp_up, dur)
-                                cur_p = tmp_up; cleanup.append(tmp_up)
+                            print(f"🔊 {len(a_s)} Tracks found.")
+                            for ix, tr in enumerate(a_s): print(f" [{ix+1}] {tr['description']}")
+                            order = input("Order (3,2,1) or Enter skip: ").strip()
+                            if not order:
+                                plans.append({'file': f, 'type': 'rename', 'dur': dur, 'target_ext': target_ext, 'cap': caps[i] if caps else None})
                             else:
-                                print(f"🔊 {len(a_s)} Tracks found.")
-                                for ix, tr in enumerate(a_s): print(f" [{ix+1}] {tr['description']}")
-                                order = input("Order (3,2,1) or Enter skip: ").strip()
-                                if not order:
-                                    new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
-                                    tmp_up = TMP / new_n
-                                    print("➡️ Renaming...")
-                                    await process_metadata_and_rename(f, tmp_up, dur)
-                                    cur_p = tmp_up; cleanup.append(tmp_up)
-                                else:
-                                    map_idx = [int(x) for x in order.split(',') if x.strip().isdigit()]
-                                    if map_idx:
-                                        selected_has_opus = False
-                                        for idx in map_idx:
-                                            if idx - 1 < len(a_s) and a_s[idx-1]['codec'].lower() == 'opus':
-                                                selected_has_opus = True; break
-                                        
-                                        if selected_has_opus or f.suffix.lower() == '.mkv':
-                                            target_ext = ".mkv"
-                                        else:
-                                            target_ext = ".mp4"
+                                map_idx = [int(x) for x in order.split(',') if x.strip().isdigit()]
+                                if map_idx:
+                                    selected_has_opus = False
+                                    for idx in map_idx:
+                                        if idx - 1 < len(a_s) and a_s[idx-1]['codec'].lower() == 'opus':
+                                            selected_has_opus = True; break
+                                    
+                                    t_ext = ".mkv" if (selected_has_opus or f.suffix.lower() == '.mkv') else ".mp4"
+                                    plans.append({'file': f, 'type': 'modify', 'dur': dur, 'target_ext': t_ext, 'map_idx': map_idx, 'cap': caps[i] if caps else None})
+                                else: print("❌ Invalid order."); continue
 
-                                        new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
-                                        tmp_up = TMP / new_n
-                                        print("➡️ Modifying Audio...")
-                                        await modify_audio_tracks_and_copy(f, tmp_up, map_idx, dur)
-                                        cur_p = tmp_up; cleanup.append(tmp_up)
-                                    else: print("❌ Invalid order."); continue
-                            
-                            jobs.append({
-                                'video_path': cur_p,
-                                'caption': caps[i] if caps else None,
-                                'unique_id': uuid.uuid4().hex,
-                                'metadata': get_video_metadata(cur_p),
-                                'cleanup_files': cleanup
-                            })
-                        except Exception as e: print(f"❌ Error: {e}")
+                    print("\n[+] Phase 2: Processing Audio and Metadata concurrently (Parallel)...")
                     
+                    async def process_mkv_task(plan):
+                        f = plan['file']
+                        uid = uuid.uuid4().hex
+                        new_n = f"{FIXED_RENAME_PREFIX}{plan['target_ext']}"
+                        tmp_up = TMP / new_n
+                        cleanup = []
+                        print(f"➡️ Task queued for: {f.name[:20]}")
+                        try:
+                            if plan['type'] == 'rename':
+                                await process_metadata_and_rename(f, tmp_up, plan['dur'])
+                            elif plan['type'] == 'modify':
+                                await modify_audio_tracks_and_copy(f, tmp_up, plan['map_idx'], plan['dur'])
+                            
+                            cleanup.append(tmp_up)
+                            return {
+                                'video_path': tmp_up,
+                                'caption': plan['cap'],
+                                'unique_id': uid,
+                                'metadata': get_video_metadata(tmp_up),
+                                'cleanup_files': cleanup,
+                                'success': True
+                            }
+                        except Exception as e:
+                            print(f"❌ Error {f.name}: {e}")
+                            return {'success': False}
+
+                    tasks = [process_mkv_task(plan) for plan in plans]
+                    results = await asyncio.gather(*tasks)
+                    
+                    for res in results:
+                        if res.get('success'):
+                            jobs.append({
+                                'video_path': res['video_path'],
+                                'caption': res['caption'],
+                                'unique_id': res['unique_id'],
+                                'metadata': res['metadata'],
+                                'cleanup_files': res['cleanup_files']
+                            })
+
                     if jobs:
                         await upload_batch_videos(client, jobs, user_id, TARGET_CHAT)
 
@@ -1107,7 +1136,7 @@ async def command_mode(client: Client):
                         total_uploads = len(final_jobs_to_process)
                         up_conf, caps = generate_caption_and_update_state(user_id, total_uploads)
 
-                        print(f"\n[+] Phase 2: Starting {total_uploads} Concurrent Conversions...")
+                        print(f"\n[+] Phase 2: Starting {total_uploads} Concurrent Conversions (Parallel)...")
                         
                         async def convert_job_task(job_idx, job_data):
                             f = job_data['source_path']
@@ -1154,8 +1183,10 @@ async def command_mode(client: Client):
                         
                         print("\n[+] Waiting for all conversions to finish...")
                         jobs = []
-                        for i, task in enumerate(conversion_tasks):
-                            result_path, temp_files = await task
+                        
+                        results = await asyncio.gather(*conversion_tasks)
+                        
+                        for i, (result_path, temp_files) in enumerate(results):
                             job_data = final_jobs_to_process[i]
                             f_name = job_data['source_path'].name
                             
@@ -1367,8 +1398,4 @@ def main():
 
 async def run_client(c):
     if not c['bot_token']: return
-    app = Client("my_session", api_id=c['api_id'], api_hash=c['api_hash'], bot_token=c['bot_token'])
-    async with app: logger.info("🟢 Online."); await command_mode(app)
-
-if __name__ == "__main__":
-    main()
+    app = Client("my_session", api_id=c['api_id'], api_hash=c['api_
