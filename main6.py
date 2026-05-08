@@ -9,12 +9,9 @@ import math
 import shutil
 import uuid 
 import zipfile
-import random
 from pathlib import Path
 from pyrogram import Client, errors
 from pyrogram.enums import ParseMode
-from pyrogram.raw.functions.messages import SendMedia
-from pyrogram.raw.types import InputMediaUploadedDocument, DocumentAttributeVideo, DocumentAttributeFilename
 from PIL import Image
 from tqdm import tqdm
 import yt_dlp
@@ -168,6 +165,28 @@ def load_queue():
     return []
 # -------------------------------
 
+# --- Recursive Zip Extractor ---
+def recursive_unzip(zip_file_path, extract_to):
+    """Recursively extract zip files including zips within zips."""
+    try:
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+        
+        # After extraction, check for more zip files in the extracted folder
+        for root, dirs, files in os.walk(extract_to):
+            for file in files:
+                if file.lower().endswith('.zip'):
+                    nested_zip_path = os.path.join(root, file)
+                    print(f"📦 Found nested zip: {file}. Extracting...")
+                    recursive_unzip(nested_zip_path, root)
+                    try:
+                        os.remove(nested_zip_path) # Delete nested zip after extraction
+                    except: pass
+        return True
+    except Exception as e:
+        print(f"❌ Extraction error: {e}")
+        return False
+
 # --- ADVANCED INTERACTIVE FILE EXPLORER ---
 def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_select_mode: bool = False) -> Path | None:
     """
@@ -184,8 +203,10 @@ def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_
 
     while True:
         if current_path.is_file():
-            if current_path.suffix.lower() in valid_extensions: return current_path
-            else: print("❌ Not a valid file."); return None
+            if current_path.suffix.lower() in valid_extensions or current_path.suffix.lower() == '.zip': 
+                return current_path
+            else: 
+                print("❌ Not a valid file."); return None
 
         try:
             all_items = sorted(list(current_path.iterdir()), key=lambda x: (not x.is_dir(), x.name.lower()))
@@ -196,7 +217,8 @@ def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_
         display_options = []
         for item in all_items:
             if item.is_dir(): display_options.append(item)
-            elif item.is_file() and item.suffix.lower() in valid_extensions: display_options.append(item)
+            elif item.is_file() and (item.suffix.lower() in valid_extensions or item.suffix.lower() == '.zip'): 
+                display_options.append(item)
 
         print(f"\n📂 **Path:** {current_path}")
         print(f" 0 > 🔙 Back")
@@ -206,7 +228,7 @@ def interactive_file_explorer(start_path: Path, valid_extensions: tuple, folder_
         if not display_options: print("   (Empty or no valid files)")
         
         for idx, item in enumerate(display_options):
-            icon = "📁" if item.is_dir() else "🎬" if item.suffix in VIDEO_EXTENSIONS else "🖼️"
+            icon = "📁" if item.is_dir() else "📦" if item.suffix.lower() == '.zip' else "🎬" if item.suffix in VIDEO_EXTENSIONS else "🖼️"
             print(f" {idx + 1} > {icon} {item.name}")
 
         sel = input("\nSelect Number (or 'c' cancel): ").strip().lower()
@@ -306,7 +328,7 @@ async def process_metadata_and_rename(input_path: Path, output_path: Path, durat
         if audio_info:
             for i in range(len(audio_info)): cmd.extend([f"-metadata:s:a:{i}", f"title={FIXED_RENAME_PREFIX}"])
         cmd.append(str(output_path))
-        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Renaming: {input_path.name[:10]}")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, "Renaming & Metadata Update")
         if not (output_path.exists() and output_path.stat().st_size > 0): raise Exception("FFmpeg failed.")
         return True
     try: return await asyncio.to_thread(sync_process)
@@ -320,7 +342,7 @@ async def modify_audio_tracks_and_copy(input_path: Path, output_path: Path, audi
             if user_index <= 0: continue
             cmd.extend(["-map", f"0:a:{user_index - 1}", f"-metadata:s:a:{i}", f"title={FIXED_RENAME_PREFIX}"])
         cmd.extend(["-map", "0:s?", "-map", "0:d?", "-disposition:a:0", "default", str(output_path)])
-        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Audio Mod: {input_path.name[:10]}")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Audio Modify: {audio_map_indices}")
         if not (output_path.exists() and output_path.stat().st_size > 0): raise Exception("FFmpeg failed.")
         return True
     try: return await asyncio.to_thread(sync_modify)
@@ -341,7 +363,7 @@ async def compress_video(input_path: Path, output_path: Path, target_bitrate_kbp
             "-b:a", f"{AUDIO_BITRATE_KBPS}k", 
             str(output_path)
         ]
-        run_ffmpeg_command_with_progress(cmd, duration_sec, f"Compressing: {input_path.name[:10]}")
+        run_ffmpeg_command_with_progress(cmd, duration_sec, "Compression (1-Pass)")
         return output_path.exists() and output_path.stat().st_size > 0
     try: return await asyncio.to_thread(sync_compress)
     except Exception as e:
@@ -476,119 +498,6 @@ async def upload_single_video(client, video_path, user_id, TARGET_CHAT, progress
         print("\n✅ Uploaded.")
     except Exception as e: logger.error(f"Upload Error: {e}")
     return cleanup 
-
-async def upload_batch_videos(client, jobs, user_id, TARGET_CHAT):
-    """
-    Parallel upload all prepared video jobs to Telegram Servers,
-    then sequentially send them to the Target Chat.
-    """
-    uploaded_medias = [None] * len(jobs)
-    thumb_paths = [None] * len(jobs)
-    
-    # Prepare thumbnails sequentially to avoid FFmpeg conflicts
-    for i, job in enumerate(jobs):
-        v_path = job['video_path']
-        u_id = job['unique_id']
-        t_path = None
-        
-        if user_id in USER_THUMBS: 
-            t_path = USER_THUMBS[user_id]
-        elif str(user_id) in USER_THUMB_TIME:
-            ts = USER_THUMB_TIME[str(user_id)]
-            out = TMP / f"thumb_{user_id}_{u_id}_{ts}s.jpg"
-            if not (out.exists() and out.stat().st_size > 0):
-                if await asyncio.to_thread(generate_video_thumbnail, v_path, out, int(ts)): 
-                    t_path = str(out); job['cleanup_files'].append(out)
-                else: 
-                    dummy = TMP/"d.jpg"; create_dummy_thumb(str(dummy)); t_path = str(dummy)
-            else: 
-                t_path = str(out); job['cleanup_files'].append(out)
-        thumb_paths[i] = t_path
-
-    print("\n" + "="*45)
-    print(f"🚀 Starting Parallel Upload for {len(jobs)} videos...")
-    print("="*45)
-
-    async def upload_task(index, job, t_path):
-        v_path = job['video_path']
-        metadata = job['metadata']
-        
-        def prog(current, total):
-            if not hasattr(prog, 'pbar'):
-                # Position index for concurrent progress bars
-                prog.pbar = tqdm(total=total, unit="B", unit_scale=True, desc=f"[{index+1}/{len(jobs)}] Up {v_path.name[:10]}", position=index, leave=True, dynamic_ncols=True)
-            prog.pbar.update(current - prog.pbar.n)
-            if current == total:
-                prog.pbar.close()
-
-        try:
-            # Upload File to Telegram Server Concurrently
-            file_id = await client.save_file(str(v_path), progress=prog)
-            
-            thumb_id = None
-            if t_path and os.path.exists(t_path):
-                thumb_id = await client.save_file(str(t_path))
-            
-            mime = "video/mp4"
-            if str(v_path).lower().endswith(".mkv"): mime = "video/x-matroska"
-            elif str(v_path).lower().endswith(".mp3"): mime = "audio/mpeg"
-            
-            media = InputMediaUploadedDocument(
-                file=file_id,
-                thumb=thumb_id,
-                mime_type=mime,
-                attributes=[
-                    DocumentAttributeVideo(
-                        duration=metadata.get('duration', 0),
-                        w=metadata.get('width', 0),
-                        h=metadata.get('height', 0),
-                        supports_streaming=True
-                    ),
-                    DocumentAttributeFilename(file_name=v_path.name)
-                ],
-                force_file=False
-            )
-            uploaded_medias[index] = media
-        except Exception as e:
-            print(f"\n❌ Upload Error Job {index+1}: {e}")
-            uploaded_medias[index] = None
-
-    # Run uploads concurrently using gather
-    tasks = [upload_task(i, jobs[i], thumb_paths[i]) for i in range(len(jobs))]
-    await asyncio.gather(*tasks)
-    
-    print("\n" * len(jobs))
-    print("✅ All parallel uploads finished. Now sending sequentially...\n")
-
-    # Sequential Send process
-    peer = await client.resolve_peer(TARGET_CHAT)
-    
-    for i, media in enumerate(uploaded_medias):
-        if not media:
-            print(f"⏭️ Skipping {jobs[i]['video_path'].name} due to upload failure.")
-            continue
-        
-        job = jobs[i]
-        cap = job['caption']
-        if cap is None:
-            lang = USER_LANGUAGE_CONFIG.get(user_id, 'fandub')
-            l_line = f"**🎧 Language - Hindi ({'OFFICIAL' if lang == 'official' else 'Fan Dub'})**" 
-            cap = f"**Upload: {job['video_path'].name}**\n{l_line}\n**Res: {job['metadata'].get('width',0)}x{job['metadata'].get('height',0)}**\n**Dur: {job['metadata'].get('duration',0)}s**"
-        
-        try:
-            message_text, message_entities = await client.parser.parse(cap, "markdown")
-            await client.invoke(
-                SendMedia(
-                    peer=peer,
-                    media=media,
-                    message=message_text,
-                    entities=message_entities,
-                    random_id=random.randint(-10**18, 10**18)
-                )
-            )
-            print(f"✅ Successfully Sent: {job['video_path'].name}")
-        except Exception as e:
-            print(f"❌ Send Error {job['video_path'].name}: {e}")
 
 # --- YOUTUBE DOWNLOAD & TG UPLOAD LOGIC ---
 async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: int, target_chat: str, progress_callback):
@@ -759,7 +668,7 @@ async def run_youtube_downloader(is_tg_upload: bool, client: Client, user_id: in
 async def command_mode(client: Client):
     global GLOBAL_CONFIG
     print("\n--- 💻 Command Mode ---")
-    print("Cmds: set_thum <path/time> | del_thum | set_cap | upload | upload_mkv | convert | youtube or yt | youtubetg or ytg | d")
+    print("Cmds: set_thum <path/time> | del_thum | set_cap | upload | upload_mkv | convert | youtube or yt | youtubetg or ytg | d | clean")
     TARGET_CHAT = GLOBAL_CONFIG.get('target_chat_id', 'me')
     user_id = CLI_USER_ID 
     def progress_callback(current, total, *args):
@@ -834,14 +743,23 @@ async def command_mode(client: Client):
                         print(f"❌ Download failed: {e}")
                         continue
                         
+                    # Check for zip and extract recursively
+                    downloaded_files = list(dl_dir.iterdir())
+                    for f in downloaded_files:
+                        if f.suffix.lower() == '.zip':
+                            print(f"📦 Extracting (Recursive) ZIP: {f.name}...")
+                            recursive_unzip(f, dl_dir)
+                            try: os.remove(f)
+                            except: pass
+                    
+                    # Refresh file list after extraction
                     downloaded_files = list(dl_dir.iterdir())
                     if not downloaded_files:
-                        print("❌ No file found after download.")
+                        print("❌ No file found after download/extraction.")
                         continue
                         
                     for f in downloaded_files:
-                        # Handle long names
-                        if len(f.name) > 100:
+                        if f.is_file() and len(f.name) > 100:
                             short_name = f.stem[:50] + f.suffix
                             new_path = dl_dir / short_name
                             try:
@@ -850,47 +768,42 @@ async def command_mode(client: Client):
                                 print(f"✂️ Renamed long file to: {f.name}")
                             except Exception as e:
                                 print(f"⚠️ Could not rename file: {e}")
-
-                        # Extract if zip
-                        if f.suffix.lower() == '.zip':
-                            print(f"📦 Extracting ZIP file: {f.name}...")
-                            try:
-                                with zipfile.ZipFile(f, 'r') as zip_ref:
-                                    zip_ref.extractall(dl_dir)
-                                f.unlink() # Delete the zip file
-                                print("✅ Extracted successfully and deleted original zip file.")
-                            except Exception as e:
-                                print(f"❌ Extraction failed: {e}")
-                                
                     p_arg = dl_dir
                 else:
                     p_arg = Path(os.path.expanduser(target_arg))
-                    
-                selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
                 
+                # Manual ZIP extraction within explorer
+                selected_path = interactive_file_explorer(p_arg, VIDEO_EXTENSIONS, folder_select_mode=True)
+                if selected_path and selected_path.is_file() and selected_path.suffix.lower() == '.zip':
+                    print(f"📦 Manual extraction triggered for: {selected_path.name}")
+                    extract_to = selected_path.parent / f"extracted_{uuid.uuid4().hex[:6]}"
+                    extract_to.mkdir(exist_ok=True)
+                    recursive_unzip(selected_path, extract_to)
+                    selected_path = extract_to # Switch explorer to extracted folder
+
                 if not selected_path: print("❌ Cancelled."); continue
 
                 files = []
                 if selected_path.is_file(): files.append(selected_path)
                 else:
-                     all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
-                     if not all_v: print("⚠️ No videos."); continue
+                     all_v = sorted([f for f in selected_path.rglob('*') if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
+                     if not all_v: print("⚠️ No videos found."); continue
                      print(f"\n📁 {selected_path.name}:")
                      f_map = {i+1: f for i, f in enumerate(all_v)}
                      for i, f in f_map.items(): print(f" {i}> {f.name}")
-                     sel = input("Select (e.g. 1,3, 5-8): ").strip()
-                     idxs = parse_range_selection(sel)
-                     if not idxs: print("⚠️ None selected."); continue
-                     for x in idxs:
-                         if x in f_map: files.append(f_map[x])
+                     sel = input("Select (e.g. 1,3, 5-8, all): ").strip()
+                     if sel.lower() == 'all':
+                         files = all_v
+                     else:
+                        idxs = parse_range_selection(sel)
+                        if not idxs: print("⚠️ None selected."); continue
+                        for x in idxs:
+                            if x in f_map: files.append(f_map[x])
 
                 if files:
                     up_conf, caps = generate_caption_and_update_state(user_id, len(files))
-                    jobs = []
-                    
-                    print("\n[+] Phase 1: Processing Metadata and Renaming concurrently (Parallel)...")
-                    
-                    async def process_up_task(i, f, cap):
+                    cleanup = []
+                    for i, f in enumerate(files):
                         uid = uuid.uuid4().hex
                         audio_info = get_audio_stream_info(f)
                         has_opus = any(s.get('codec', '').lower() == 'opus' for s in audio_info)
@@ -903,47 +816,18 @@ async def command_mode(client: Client):
                         new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
                         tmp_up = TMP / new_n
                         
-                        print(f"➡️ Task queued for: {f.name[:20]}")
+                        print(f"\n--- Processing {f.name} -> {new_n} ---")
                         dur = get_video_metadata(f)['duration']
-                        cleanup = []
                         try:
                             await process_metadata_and_rename(f, tmp_up, dur)
                             cleanup.append(tmp_up)
-                            
-                            return {
-                                'video_path': tmp_up,
-                                'caption': cap,
-                                'unique_id': uid,
-                                'metadata': get_video_metadata(tmp_up),
-                                'cleanup_files': cleanup,
-                                'success': True
-                            }
-                        except Exception as e:
-                            print(f"❌ Error {f.name}: {e}")
-                            return {'success': False}
-
-                    tasks = [process_up_task(i, f, caps[i] if caps else None) for i, f in enumerate(files)]
-                    results = await asyncio.gather(*tasks)
-                    
-                    for res in results:
-                        if res.get('success'):
-                            jobs.append({
-                                'video_path': res['video_path'],
-                                'caption': res['caption'],
-                                'unique_id': res['unique_id'],
-                                'metadata': res['metadata'],
-                                'cleanup_files': res['cleanup_files']
-                            })
-                    
-                    if jobs:
-                        await upload_batch_videos(client, jobs, user_id, TARGET_CHAT)
-
+                            th = await upload_single_video(client, tmp_up, user_id, TARGET_CHAT, progress_callback, caps[i] if caps else None, uid)
+                            if th: cleanup.append(th)
+                        except Exception as e: print(f"❌ Error {f.name}: {e}")
                     if up_conf['enabled']: USER_CAPTION_CONFIG[user_id] = up_conf; save_config(GLOBAL_CONFIG)
-                    
-                    for job in jobs:
-                        for x in job['cleanup_files']: 
-                            try: os.remove(x)
-                            except: pass
+                    for x in cleanup: 
+                        try: os.remove(x)
+                        except: pass
                     print("✅ Batch Done.")
 
             elif cmd == 'upload_mkv':
@@ -956,7 +840,7 @@ async def command_mode(client: Client):
                 files = []
                 if selected_path.is_file(): files.append(selected_path)
                 else:
-                    all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
+                    all_v = sorted([f for f in selected_path.rglob('*') if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
                     if not all_v: print("⚠️ No videos."); continue
                     print(f"\n📁 {selected_path.name}:")
                     f_map = {i+1: f for i, f in enumerate(all_v)}
@@ -969,89 +853,61 @@ async def command_mode(client: Client):
 
                 if files:
                     up_conf, caps = generate_caption_and_update_state(user_id, len(files))
-                    jobs = []
-                    
-                    print("\n[+] Phase 1: Analyzing Audio Tracks (Interactive)...")
-                    plans = []
+                    cleanup = []
                     for i, f in enumerate(files):
                         print(f"\n--- Checking {f.name} ---")
                         a_s = get_audio_stream_info(f)
-                        dur = get_video_metadata(f)['duration']
+                        cur_p = f; dur = get_video_metadata(f)['duration']
                         
                         has_opus = any(s.get('codec', '').lower() == 'opus' for s in a_s)
-                        target_ext = ".mkv" if (has_opus or f.suffix.lower() == '.mkv') else ".mp4"
-                            
-                        if len(a_s) <= 1:
-                            plans.append({'file': f, 'type': 'rename', 'dur': dur, 'target_ext': target_ext, 'cap': caps[i] if caps else None})
+                        if has_opus or f.suffix.lower() == '.mkv':
+                            target_ext = ".mkv"
                         else:
-                            print(f"🔊 {len(a_s)} Tracks found.")
-                            for ix, tr in enumerate(a_s): print(f" [{ix+1}] {tr['description']}")
-                            order = input("Order (3,2,1) or Enter skip: ").strip()
-                            if not order:
-                                plans.append({'file': f, 'type': 'rename', 'dur': dur, 'target_ext': target_ext, 'cap': caps[i] if caps else None})
-                            else:
-                                map_idx = [int(x) for x in order.split(',') if x.strip().isdigit()]
-                                if map_idx:
-                                    selected_has_opus = False
-                                    for idx in map_idx:
-                                        if idx - 1 < len(a_s) and a_s[idx-1]['codec'].lower() == 'opus':
-                                            selected_has_opus = True; break
-                                    
-                                    t_ext = ".mkv" if (selected_has_opus or f.suffix.lower() == '.mkv') else ".mp4"
-                                    plans.append({'file': f, 'type': 'modify', 'dur': dur, 'target_ext': t_ext, 'map_idx': map_idx, 'cap': caps[i] if caps else None})
-                                else: print("❌ Invalid order."); continue
-
-                    print("\n[+] Phase 2: Processing Audio and Metadata concurrently (Parallel)...")
-                    
-                    async def process_mkv_task(plan):
-                        f = plan['file']
-                        uid = uuid.uuid4().hex
-                        new_n = f"{FIXED_RENAME_PREFIX}{plan['target_ext']}"
-                        tmp_up = TMP / new_n
-                        cleanup = []
-                        print(f"➡️ Task queued for: {f.name[:20]}")
-                        try:
-                            if plan['type'] == 'rename':
-                                await process_metadata_and_rename(f, tmp_up, plan['dur'])
-                            elif plan['type'] == 'modify':
-                                await modify_audio_tracks_and_copy(f, tmp_up, plan['map_idx'], plan['dur'])
+                            target_ext = ".mp4"
                             
-                            cleanup.append(tmp_up)
-                            return {
-                                'video_path': tmp_up,
-                                'caption': plan['cap'],
-                                'unique_id': uid,
-                                'metadata': get_video_metadata(tmp_up),
-                                'cleanup_files': cleanup,
-                                'success': True
-                            }
-                        except Exception as e:
-                            print(f"❌ Error {f.name}: {e}")
-                            return {'success': False}
+                        try:
+                            if len(a_s) <= 1:
+                                new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
+                                tmp_up = TMP / new_n
+                                print("➡️ Renaming...")
+                                await process_metadata_and_rename(f, tmp_up, dur)
+                                cur_p = tmp_up; cleanup.append(tmp_up)
+                            else:
+                                print(f"🔊 {len(a_s)} Tracks found.")
+                                for ix, tr in enumerate(a_s): print(f" [{ix+1}] {tr['description']}")
+                                order = input("Order (3,2,1) or Enter skip: ").strip()
+                                if not order:
+                                    new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
+                                    tmp_up = TMP / new_n
+                                    print("➡️ Renaming...")
+                                    await process_metadata_and_rename(f, tmp_up, dur)
+                                    cur_p = tmp_up; cleanup.append(tmp_up)
+                                else:
+                                    map_idx = [int(x) for x in order.split(',') if x.strip().isdigit()]
+                                    if map_idx:
+                                        selected_has_opus = False
+                                        for idx in map_idx:
+                                            if idx - 1 < len(a_s) and a_s[idx-1]['codec'].lower() == 'opus':
+                                                selected_has_opus = True; break
+                                        
+                                        if selected_has_opus or f.suffix.lower() == '.mkv':
+                                            target_ext = ".mkv"
+                                        else:
+                                            target_ext = ".mp4"
 
-                    tasks = [process_mkv_task(plan) for plan in plans]
-                    results = await asyncio.gather(*tasks)
-                    
-                    for res in results:
-                        if res.get('success'):
-                            jobs.append({
-                                'video_path': res['video_path'],
-                                'caption': res['caption'],
-                                'unique_id': res['unique_id'],
-                                'metadata': res['metadata'],
-                                'cleanup_files': res['cleanup_files']
-                            })
-
-                    if jobs:
-                        await upload_batch_videos(client, jobs, user_id, TARGET_CHAT)
-
+                                        new_n = f"{FIXED_RENAME_PREFIX}{target_ext}"
+                                        tmp_up = TMP / new_n
+                                        print("➡️ Modifying Audio...")
+                                        await modify_audio_tracks_and_copy(f, tmp_up, map_idx, dur)
+                                        cur_p = tmp_up; cleanup.append(tmp_up)
+                                    else: print("❌ Invalid order."); continue
+                            th = await upload_single_video(client, cur_p, user_id, TARGET_CHAT, progress_callback, caps[i] if caps else None, uuid.uuid4().hex)
+                            if th: cleanup.append(th)
+                        except Exception as e: print(f"❌ Error: {e}")
                     if up_conf['enabled']: USER_CAPTION_CONFIG[user_id] = up_conf; save_config(GLOBAL_CONFIG)
-                    
-                    for job in jobs:
-                        for x in job['cleanup_files']: 
-                            try: os.remove(x)
-                            except: pass
-                    print("✅ Batch Done.")
+                    for x in cleanup: 
+                        try: os.remove(x)
+                        except: pass
 
             elif cmd == 'convert':
                 is_up = False
@@ -1136,7 +992,7 @@ async def command_mode(client: Client):
                         total_uploads = len(final_jobs_to_process)
                         up_conf, caps = generate_caption_and_update_state(user_id, total_uploads)
 
-                        print(f"\n[+] Phase 2: Starting {total_uploads} Concurrent Conversions (Parallel)...")
+                        print(f"\n[+] Phase 2: Starting {total_uploads} Concurrent Conversions...")
                         
                         async def convert_job_task(job_idx, job_data):
                             f = job_data['source_path']
@@ -1181,43 +1037,28 @@ async def command_mode(client: Client):
                             task = asyncio.create_task(convert_job_task(i, job))
                             conversion_tasks.append(task)
                         
-                        print("\n[+] Waiting for all conversions to finish...")
-                        jobs = []
+                        print("\n[+] Waiting for conversions and uploading strictly in sequence...")
                         
-                        results = await asyncio.gather(*conversion_tasks)
-                        
-                        for i, (result_path, temp_files) in enumerate(results):
+                        for i, task in enumerate(conversion_tasks):
+                            result_path, temp_files = await task
                             job_data = final_jobs_to_process[i]
                             f_name = job_data['source_path'].name
                             
                             if result_path and result_path.exists():
                                 if is_up:
-                                    temp_files.append(result_path)
-                                    jobs.append({
-                                        'video_path': result_path,
-                                        'caption': caps[i],
-                                        'unique_id': uuid.uuid4().hex,
-                                        'metadata': get_video_metadata(result_path),
-                                        'cleanup_files': temp_files
-                                    })
+                                    print(f"\n--- Uploading [Job {i+1}]: {f_name} ---")
+                                    th = await upload_single_video(client, result_path, user_id, TARGET_CHAT, progress_callback, caps[i], uuid.uuid4().hex)
+                                    if th: temp_files.append(th)
                                 else:
                                     print(f"\n✅ Saved [Job {i+1}]: {result_path}")
-                                    temp_files.append(result_path)
-                                    for x in temp_files:
-                                        try: os.remove(x)
-                                        except: pass
+                                
+                                temp_files.append(result_path)
                             else:
                                 print(f"\n❌ Failed to process [Job {i+1}]: {f_name}")
-                                for x in temp_files:
-                                    try: os.remove(x)
-                                    except: pass
-                        
-                        if jobs and is_up:
-                            await upload_batch_videos(client, jobs, user_id, TARGET_CHAT)
-                            for job in jobs:
-                                for x in job['cleanup_files']:
-                                    try: os.remove(x)
-                                    except: pass
+                                
+                            for x in temp_files:
+                                try: os.remove(x)
+                                except: pass
                         
                         for job in final_jobs_to_process:
                             if job.get('is_url', False):
@@ -1248,7 +1089,7 @@ async def command_mode(client: Client):
                         if selected_path.is_file(): 
                             target_list.append(str(selected_path))
                         else:
-                            all_v = sorted([f for f in selected_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
+                            all_v = sorted([f for f in selected_path.rglob('*') if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS])
                             if not all_v: 
                                 print("⚠️ No valid videos found in folder.")
                                 continue
@@ -1383,6 +1224,19 @@ async def command_mode(client: Client):
                         print(f"❌ Failed to upload to Google Drive: {e}")
                         
                     shutil.rmtree(dl_dir, ignore_errors=True)
+
+            elif cmd == 'clean':
+                confirm = input("⚠️ Clear all downloads and temporary folders? (y/n): ").strip().lower()
+                if confirm == 'y':
+                    try:
+                        shutil.rmtree(DOWNLOAD_PATH, ignore_errors=True)
+                        shutil.rmtree(str(TMP), ignore_errors=True)
+                        os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+                        TMP.mkdir(exist_ok=True)
+                        print("✅ Cleaned storage folders.")
+                    except Exception as e:
+                        print(f"❌ Cleaning failed: {e}")
+                else: print("❌ Cancelled.")
 
             else: print("❌ Unknown.")
         except Exception as e: logger.error(f"Err: {e}")
